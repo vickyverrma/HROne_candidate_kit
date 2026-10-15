@@ -1,8 +1,8 @@
 """
 Employee Attendance & Analytics API
 
-Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
+FastAPI service backed by MongoDB for employee attendance management,
+regularization workflows, and analytical rollups (R1 - R10).
 """
 import calendar
 import os
@@ -21,6 +21,7 @@ from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
+# MongoDB connection using tz-aware setting to ensure BSON dates map to UTC datetimes
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
@@ -28,11 +29,10 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MONTH_REGEX = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
 
-# --------------------------------------------------------------------------- #
-# Helpers & Conversions
-# --------------------------------------------------------------------------- #
+# --- Date & Calculation Utilities ---
+
 def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
-    """Convert datetime to epoch milliseconds integer (UTC)."""
+    """Convert UTC/naive datetime to epoch milliseconds integer for API responses."""
     if dt is None:
         return None
     if dt.tzinfo is None:
@@ -41,7 +41,7 @@ def dt_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
 
 
 def epoch_ms_to_dt(ms: Optional[int]) -> Optional[datetime]:
-    """Convert epoch milliseconds to timezone-aware UTC datetime truncated to seconds (R1)."""
+    """Convert epoch milliseconds to a UTC datetime truncated to whole seconds (per R1)."""
     if ms is None:
         return None
     sec = ms // 1000
@@ -49,15 +49,14 @@ def epoch_ms_to_dt(ms: Optional[int]) -> Optional[datetime]:
 
 
 def round_half_up(val: Optional[float], decimals: int = 2) -> Optional[float]:
-    """Round a number half-up to given decimal places (R4, R8)."""
+    """Python's round() uses round-half-to-even (banker's rounding). R4/R8 require true half-up."""
     if val is None:
         return None
-    fmt = "0." + "0" * decimals if decimals > 0 else "1"
-    return float(Decimal(str(val)).quantize(Decimal(fmt), rounding=ROUND_HALF_UP))
+    pattern = "0." + "0" * decimals if decimals > 0 else "1"
+    return float(Decimal(str(val)).quantize(Decimal(pattern), rounding=ROUND_HALF_UP))
 
 
 def get_month_days_range(month_str: str) -> tuple[str, str, int]:
-    """Given 'YYYY-MM', returns (first_day_str, last_day_str, days_in_month)."""
     year, month = map(int, month_str.split("-"))
     _, num_days = calendar.monthrange(year, month)
     first_day = f"{month_str}-01"
@@ -66,25 +65,25 @@ def get_month_days_range(month_str: str) -> tuple[str, str, int]:
 
 
 def count_working_days(start_date_str: str, end_date_str: str) -> int:
-    """R7: Count Mon-Fri days between start_date_str and end_date_str inclusive."""
+    """R7: Monday through Friday only, no holiday calendar."""
     start = datetime.strptime(start_date_str, "%Y-%m-%d").date()
     end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
     if start > end:
         return 0
     cur = start
-    count = 0
+    work_days = 0
     while cur <= end:
-        if cur.weekday() < 5:  # Monday=0, ..., Friday=4
-            count += 1
+        if cur.weekday() < 5:
+            work_days += 1
         cur += timedelta(days=1)
-    return count
+    return work_days
 
 
 def get_attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
     """
-    R1: Attendance date is IST calendar date.
-    For overnight shifts (shift_end <= shift_start), a punch-in before shift_end
-    belongs to the shift that started the previous day.
+    R1: Attendance date is the IST calendar date of punch_in.
+    Overnight shifts (shift_end <= shift_start): punch-ins before shift_end
+    belong to the shift that started on the previous calendar day.
     """
     p_in = punch_in if punch_in.tzinfo else punch_in.replace(tzinfo=timezone.utc)
     p_in_ist = p_in.astimezone(IST)
@@ -96,9 +95,8 @@ def get_attendance_date(punch_in: datetime, shift_start: str, shift_end: str) ->
 
 def compute_late_minutes(punch_in: datetime, shift_start: str, attendance_date: Optional[str] = None) -> int:
     """
-    R2: Grace period is 10 minutes. A punch-in is late only if strictly more than
-    10:00 (600s) after shift_start. When late, late_minutes = whole minutes (floor)
-    elapsed since shift_start, not since grace period ended. Otherwise 0.
+    R2: 10-minute grace period. Punch-in is late ONLY if strictly > 10:00 (600s) past shift_start.
+    When late, late_minutes = floor elapsed minutes since shift_start (not since grace ended).
     """
     p_in = punch_in if punch_in.tzinfo else punch_in.replace(tzinfo=timezone.utc)
     p_in_ist = p_in.astimezone(IST)
@@ -113,10 +111,7 @@ def compute_late_minutes(punch_in: datetime, shift_start: str, attendance_date: 
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    """
-    R4: (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up.
-    Instants are truncated to whole seconds (R1).
-    """
+    """R4: (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up."""
     p_in = punch_in if punch_in.tzinfo else punch_in.replace(tzinfo=timezone.utc)
     p_out = punch_out if punch_out.tzinfo else punch_out.replace(tzinfo=timezone.utc)
     sec = int((p_out - p_in).total_seconds())
@@ -128,7 +123,8 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
 
 def compute_overtime(punch_out: datetime, shift_end: str, date_str: str, shift_start: str = "09:30") -> int:
     """
-    R3: Whole minutes (floor) from shift_end to punch_out, counted only if >= 30; otherwise 0.
+    R3: Whole minutes (floor) between shift_end and punch_out.
+    Counted only if >= 30 minutes; otherwise 0.
     Handles overnight shifts across midnight (shift_end <= shift_start).
     """
     p_out = punch_out if punch_out.tzinfo else punch_out.replace(tzinfo=timezone.utc)
@@ -148,14 +144,15 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str, shift_s
 
 
 def compute_half_day(work_hours: Optional[float]) -> bool:
-    """R5: After punch-out, half_day is true when work_hours < 4.50."""
+    """R5: Half day is true when rounded work_hours < 4.50."""
     if work_hours is None:
         return False
     return work_hours < 4.50
 
 
+# --- Response Serializers ---
+
 def doc_to_employee(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Serialize MongoDB employee document to API response shape."""
     res = dict(doc)
     res.pop("_id", None)
     if "created_at" in res and isinstance(res["created_at"], datetime):
@@ -164,7 +161,6 @@ def doc_to_employee(doc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def doc_to_attendance_record(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Serialize MongoDB attendance document to API response shape (no id/_id, epoch ms)."""
     res = dict(doc)
     res.pop("_id", None)
     res.pop("id", None)
@@ -203,9 +199,8 @@ def doc_to_attendance_record(doc: Dict[str, Any]) -> Dict[str, Any]:
     return res
 
 
-# --------------------------------------------------------------------------- #
-# Pipelines for Analytics & Explain
-# --------------------------------------------------------------------------- #
+# --- Aggregation Pipelines ---
+
 def build_employee_monthly_pipeline(emp_code: str, month: str) -> List[Dict[str, Any]]:
     first_day, last_day, _ = get_month_days_range(month)
     return [
@@ -237,7 +232,7 @@ def build_employee_monthly_pipeline(emp_code: str, month: str) -> List[Dict[str,
                             {
                                 "$and": [
                                     {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                    {"$lte": ["$dayOfWeek", 5]},  # Mon-Fri only
+                                    {"$lte": ["$dayOfWeek", 5]},
                                 ]
                             },
                             {"$cond": ["$half_day", 0.5, 1.0]},
@@ -600,9 +595,8 @@ def build_department_trend_pipeline(department: str, from_str: str, to_str: str)
     ]
 
 
-# --------------------------------------------------------------------------- #
-# Models
-# --------------------------------------------------------------------------- #
+# --- Request Validation Models ---
+
 class EmployeeIn(BaseModel):
     emp_code: str = Field(..., pattern=r"^EMP\d{4,6}$")
     name: str = Field(..., min_length=1, max_length=100)
@@ -642,12 +636,11 @@ class RegularizeIn(BaseModel):
     punch_out: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
 
 
-# --------------------------------------------------------------------------- #
-# Lifespan
-# --------------------------------------------------------------------------- #
+# --- Startup & Index Lifecycle ---
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure indexes exist idempotently at startup
+    # Idempotent index creation on startup
     db.employees.create_index("emp_code", unique=True)
     db.employees.create_index([("department", 1), ("joined_on", 1)])
     db.employees.create_index("joined_on")
@@ -663,9 +656,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
-# --------------------------------------------------------------------------- #
-# Endpoints
-# --------------------------------------------------------------------------- #
+# --- Endpoints ---
+
 @app.get("/health")
 def health():
     try:
@@ -747,7 +739,7 @@ def punch_out(body: PunchOutIn):
     else:
         ts = datetime.now(timezone.utc).replace(microsecond=0)
 
-    # Find the most recent record whose punch_in <= punched_at
+    # Fetch the most recent open record on or before punch time
     record = db.attendance_logs.find_one(
         {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
         sort=[("punch_in", -1)],
@@ -770,6 +762,7 @@ def punch_out(body: PunchOutIn):
     overtime_minutes = compute_overtime(ts, emp["shift_end"], record["date"], emp["shift_start"])
     half_day = compute_half_day(work_hours)
 
+    # Atomic update on punch_out: None prevents concurrent punch-out race
     updated = db.attendance_logs.find_one_and_update(
         {"_id": record["_id"], "punch_out": None},
         {
@@ -851,7 +844,6 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
     if not record:
         raise HTTPException(404, "Attendance record not found")
 
-    # Determine target status and punches
     old_status = record.get("status")
     target_status = body.status if body.status is not None else old_status
 
@@ -875,17 +867,14 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
             if target_punch_out and target_punch_out.tzinfo is None:
                 target_punch_out = target_punch_out.replace(tzinfo=timezone.utc)
 
-        # Presence status requires punch_in
         if target_status in ("PRESENT", "WFH", "ON_DUTY") and target_punch_in is None:
             raise HTTPException(422, "Presence status requires punch_in")
 
-        # punch_in must stay on record's attendance date (R1)
         if target_punch_in is not None:
             derived_date = get_attendance_date(target_punch_in, emp["shift_start"], emp["shift_end"])
             if derived_date != date:
                 raise HTTPException(422, "punch_in must stay on the record's attendance date")
 
-        # punch_out must be after punch_in and within 24 hours
         if target_punch_out is not None:
             if target_punch_in is None:
                 raise HTTPException(422, "punch_out cannot be set without punch_in")
@@ -893,7 +882,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
             if diff_sec <= 0 or diff_sec > 24 * 3600:
                 raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
 
-    # Compute target derived values
+    # Recompute derived fields for target state
     if target_status in ("ABSENT", "LEAVE"):
         new_late_minutes = 0
         new_work_hours = None
@@ -910,7 +899,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
             new_overtime_minutes = 0
             new_half_day = False
 
-    # Collect actual changes
+    # Track only fields that genuinely changed
     changes: Dict[str, Any] = {}
     if old_status != target_status:
         changes["status"] = {"from": old_status, "to": target_status}
@@ -954,6 +943,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeIn):
         "changes": changes,
     }
 
+    # Optimistic locking on history array length avoids losing concurrent edits
     cur_history_len = len(record.get("history", []))
     updated = db.attendance_logs.find_one_and_update(
         {
